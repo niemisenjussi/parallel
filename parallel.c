@@ -38,10 +38,10 @@
 #define WINDOW_WIDTH  1024
 
 // The number of satelites can be changed to see how it affects performance
-#define SATELITE_COUNT 32
+#define SATELITE_COUNT 125
 
 // Define number of OpenCL kernels
-#define LOCAL_ITEM_SIZE 64
+#define LOCAL_ITEM_SIZE 32
 
 // These are used to control the satelite movement
 #define SATELITE_RADIUS 3.16f
@@ -53,6 +53,14 @@
 #define HORIZONTAL_CENTER (WINDOW_WIDTH / 2)
 #define VERTICAL_CENTER (WINDOW_HEIGHT / 2)
 
+//Create OpenCL constant variables by using macro
+#define TEXTIFY(A) #A
+#define _OPTION_CREATOR(WIDTH, HEIGHT, RAD, CNT)	\
+				" -D WINDOW_WIDTH=" TEXTIFY(WIDTH) 		\
+			   " -D WINDOW_HEIGHT=" TEXTIFY(HEIGHT)	\
+ 			   " -D SAT_RADIUS=" TEXTIFY(RAD)  			\
+ 			   " -D SAT_COUNT=" TEXTIFY(CNT)
+#define CL_OPTIONS _OPTION_CREATOR(WINDOW_WIDTH, WINDOW_HEIGHT, SATELITE_RADIUS, SATELITE_COUNT)
 
 // Is used to find out frame times
 int previousFrameTimeSinceStart = 0;
@@ -89,16 +97,21 @@ typedef struct{
 // Pixel buffer which is rendered to the screen
 color* pixels;
 
+char* pixel_ids;
+
 // Pixel buffer which is used for error checking
 color* correctPixels;
 
 // Buffer for all satelites in the space
 satelite* satelites;
 
+float render_avg = 0;
+
 
 render_parameters* render_param = NULL;
 
 #define MAX_SOURCE_SIZE (0x100000)
+#define MAX_OPTIONS_SIZE (0x100000)
 
 cl_platform_id platform_id = NULL;
 cl_device_id device_id = NULL;   
@@ -107,6 +120,7 @@ cl_uint ret_num_platforms;
 
 // ## You may add your own variables here ##
 
+cl_mem satelite_id_gpu = NULL;
 cl_mem satelite_data_gpu = NULL;
 cl_mem pixels_gpu = NULL;
 cl_mem render_parameters_gpu = NULL;
@@ -114,6 +128,8 @@ cl_program program = NULL;
 cl_kernel kernel = NULL;
 command_queue = NULL;
 cl_context context = NULL;
+
+
 
 
 const char *getErrorString(cl_int error){
@@ -219,6 +235,8 @@ void init(){
 	source_str = (char*)malloc(MAX_SOURCE_SIZE);
 	source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
 	fclose( fp );
+	
+	pixel_ids = (char*)malloc(sizeof(char) * SIZE);
 
 	render_param = (render_parameters*)malloc(sizeof(render_parameters));
 	render_param->window_height = WINDOW_HEIGHT;
@@ -253,20 +271,30 @@ void init(){
 	fprintf(stdout, "satelite_data_gpu size:%ld\n",SATELITE_COUNT * sizeof(satelite));
 	fprintf(stdout, "satelite_data_gpu id:%d\n",satelite_data_gpu);
 	
+	
 	render_parameters_gpu = clCreateBuffer(context, CL_MEM_READ_ONLY,  sizeof(render_parameters), NULL, &ret);
 	fprintf(stdout, "render_parameters size:%ld\n", sizeof(render_parameters));
 	fprintf(stdout, "render_parameters id:%d\n",render_parameters_gpu);
 	
-	pixels_gpu = clCreateBuffer(context, CL_MEM_WRITE_ONLY, SIZE * sizeof(color), NULL, &ret);
+	
+	/*pixels_gpu = clCreateBuffer(context, CL_MEM_WRITE_ONLY, SIZE * sizeof(color), NULL, &ret);
 	fprintf(stdout, "pixels_gpu size:%ld\n",SIZE * sizeof(color));
 	fprintf(stdout, "pixels_gpu id:%d\n",pixels_gpu);
+	*/
+	
+	satelite_id_gpu = clCreateBuffer(context, CL_MEM_WRITE_ONLY,  sizeof(int)*SIZE, NULL, &ret);
+	fprintf(stdout, "render_parameters size:%ld\n", sizeof(int));
+	fprintf(stdout, "render_parameters id:%d\n",satelite_id_gpu);
 	
 	// Create a program from the kernel source
 	program = clCreateProgramWithSource(context, 1, (const char **)&source_str, (const size_t *)&source_size, &ret);
 
 	// Build the program
+	char *opts = CL_OPTIONS;
+	printf("CL-kernel options: %s\n", CL_OPTIONS);
+
 	fprintf(stdout, "Bulding OpenCL kernel\n");
-	ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+	ret = clBuildProgram(program, 1, &device_id, opts, NULL, NULL);
 	if (ret != CL_SUCCESS){
 		fprintf(stderr, "ERROR clBuildProgram\n");
 		fprintf(stderr, getErrorString(ret));
@@ -287,16 +315,24 @@ void init(){
 		fprintf(stderr, getErrorString(ret));
 		exit(0);
 	}
+	
 	ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&render_parameters_gpu);
 	if (ret != CL_SUCCESS){
 		fprintf(stderr, getErrorString(ret));
 		exit(0);
 	}
-	ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&pixels_gpu);
+	/*ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&pixels_gpu);
+	if (ret != CL_SUCCESS){
+		fprintf(stderr, getErrorString(ret));
+		exit(0);
+	}*/
+	
+	ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&satelite_id_gpu);
 	if (ret != CL_SUCCESS){
 		fprintf(stderr, getErrorString(ret));
 		exit(0);
 	}
+		
 	
 	fprintf(stdout, "Setting kernel render parameters\n");
 	ret = clEnqueueWriteBuffer(command_queue, render_parameters_gpu, CL_TRUE, 0, sizeof(render_parameters), render_param, 0, NULL, NULL);
@@ -372,20 +408,39 @@ void parallelGraphicsEngine(){
 		exit(0);
 	}
 	
+	
 	// Execute the OpenCL kernel on the list
-	size_t global_item_size = SIZE; // Process the entire lists
+	size_t global_item_size = SIZE/LOCAL_ITEM_SIZE;//LOCAL_ITEM_SIZE; // Process the entire lists
 	size_t local_item_size = LOCAL_ITEM_SIZE; // Divide work items into groups of 64
 	ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_item_size, &local_item_size, 0, NULL, NULL);
 	if (ret != CL_SUCCESS){
 		fprintf(stderr, getErrorString(ret));
 		exit(0);
 	}
-	//fprintf(stdout, "clEnqueueNDRangeKernel done\n");
 	
+	/*
 	ret = clEnqueueReadBuffer(command_queue, pixels_gpu, CL_TRUE, 0, SIZE * sizeof(color), pixels, 0, NULL, NULL);
 	if (ret != CL_SUCCESS){
 		fprintf(stderr, getErrorString(ret));
 		exit(0);
+	}*/
+	
+	ret = clEnqueueReadBuffer(command_queue, satelite_id_gpu, CL_TRUE, 0, SIZE * sizeof(char), pixel_ids, 0, NULL, NULL);
+	if (ret != CL_SUCCESS){
+		fprintf(stderr, getErrorString(ret));
+		exit(0);
+	}
+	
+	color default_cl = {.red = 1.0f, .green= 1.0f, .blue=1.0f};
+	for (int i = 0; i < SIZE; i++){
+		char id = pixel_ids[i];
+		if (id == -1){
+			pixels[i] = default_cl;
+		}
+		else{
+			color cl = satelites[id].identifier;
+			pixels[i] = cl;
+		}
 	}
 
 }
@@ -393,6 +448,7 @@ void parallelGraphicsEngine(){
 // ## You may add your own destrcution routines here ##
 void destroy(){
 	// Clean up
+	free(pixel_ids);
 	free(render_param);
 	cl_int ret = clFlush(command_queue);
 	ret = clFinish(command_queue);
@@ -484,8 +540,9 @@ void compute(void){
 
    // Print timings
    int pixelColoringTime = glutGet(GLUT_ELAPSED_TIME) - timeSinceStart;
-   printf("Total frametime: %ims, satelite moving: %ims, space coloring: %ims.\n",
-      deltaTime, sateliteMovementTime, pixelColoringTime);
+   render_avg = (render_avg*9+pixelColoringTime)/10;
+   printf("Total frametime: %ims, satelite moving: %ims, space coloring: %ims. avg:%fms\n",
+      deltaTime, sateliteMovementTime, pixelColoringTime, render_avg);
 
    // Render the frame
    glutPostRedisplay();
