@@ -40,7 +40,7 @@
 #define WINDOW_WIDTH  1024
 
 // The number of satelites can be changed to see how it affects performance
-#define SATELITE_COUNT 1500
+#define SATELITE_COUNT 242
 
 // These are used to control the satelite movement
 #define SATELITE_RADIUS 3.16f
@@ -503,7 +503,7 @@ void init(){
 // is not accurate enough to be done only once
 void parallelPhysicsEngine(int deltaTime){
    const int physicsUpdatesInOneFrame = 10000;
-	#pragma omp parallel for
+	#pragma omp parallel for num_threads(SATELITE_COUNT)
    for(int i = 0; i < SATELITE_COUNT; ++i){
       // Distance to the blackhole (bit ugly code because C-struct cannot have member functions)
       vector positionToBlackHole = {.x = satelites[i].position.x -
@@ -584,6 +584,7 @@ void parallelGraphicsEngine(){
 	color default_cl = {.red = 1.0f, .green= 1.0f, .blue=1.0f};
 	
 	//Wait data transfer to complete before continue
+	//#pragma omp parallel for num_threads(num_of_cldevices)
 	for (int d = 0; d < num_of_cldevices; d++){
 		//Wait for buffer read to be ready
 		ret = clWaitForEvents(1, &cl_devices[d].evnt);
@@ -593,7 +594,7 @@ void parallelGraphicsEngine(){
 		//Loop through all satelite ID:s and assign final colors to pixel -array
 		int offset_start = (cl_devices[d].global_start_y);
 		int offset_stop = (cl_devices[d].global_stop_y);
-
+		#pragma omp parallel for num_threads(num_of_cldevices)
 		for (int i = offset_start; i < offset_stop; i++){
 			#if SATELITE_COUNT < 255
 			uint8_t id = cl_devices[d].pixel_ids[i-offset_start];

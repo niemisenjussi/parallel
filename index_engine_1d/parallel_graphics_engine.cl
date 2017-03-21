@@ -17,9 +17,9 @@ typedef struct{
 } satelite;
 
 #if SAT_COUNT < 255
-	__kernel void render(__global const satelite *satelites,	__global unsigned char *sat_ids,	 __global const int *offset_start) {
+	__kernel void render(__constant satelite *satelites,	__global unsigned char *sat_ids,	 __constant int *offset_start) {
 #else
-	__kernel void render(__global const satelite *satelites,	__global int *sat_ids,	 __global const int *offset_start) {
+	__kernel void render(__constant satelite *satelites,	__global int *sat_ids,	 __constant int *offset_start) {
 #endif
  //http://stackoverflow.com/questions/23535040/opencl-size-of-local-memory-has-impact-on-speed
  //https://software.intel.com/en-us/articles/using-opencl-20-work-group-functions
