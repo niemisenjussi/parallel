@@ -4,10 +4,10 @@
 */
 
 // Example compilation on linux
-// no optimization:   gcc -o parallel parallel.c -std=c99 -lglut -lGL -lm
-// full optimization: gcc -o parallel parallel.c -std=c99 -lglut -lGL -lm -O3
-// prev and OpenMP:   gcc -o parallel parallel.c -std=c99 -lglut -lGL -lm -O3 -fopenmp
-// prev and OpenCL:   gcc -o parallel parallel.c -std=c99 -lglut -lGL -lm -O3 -fopenmp -lOpenCL
+// no optimization:   gcc -o parallel parallel.c -std=c99 -lglut -lGL -lm -fno-stack-protector
+// full optimization: gcc -o parallel parallel.c -std=c99 -lglut -lGL -lm -O3 -fno-stack-protector
+// prev and OpenMP:   gcc -o parallel parallel.c -std=c99 -lglut -lGL -lm -O3 -fopenmp -fno-stack-protector
+// prev and OpenCL:   gcc -o parallel parallel.c -std=c99 -lglut -lGL -lm -O3 -fopenmp -lOpenCL -fno-stack-protector
 
 // Example compilation on macos X
 // no optimization:   gcc -o parallel parallel.c -std=c99 -framework GLUT -framework OpenGL
@@ -21,6 +21,7 @@
 #include <stdlib.h>
 
 //own variables
+#include <sys/time.h>  
 //#include <cmath>
 #include <CL/cl.h>
 #define __CL_ENABLE_EXCEPTIONS
@@ -38,10 +39,11 @@
 #define WINDOW_WIDTH  1024
 
 // The number of satelites can be changed to see how it affects performance
-#define SATELITE_COUNT 125
+#define SATELITE_COUNT 35
 
-// Define number of OpenCL kernels
-#define LOCAL_ITEM_SIZE 32
+
+#define LOCAL_ITEM_SIZE_X 2
+#define LOCAL_ITEM_SIZE_Y 2
 
 // These are used to control the satelite movement
 #define SATELITE_RADIUS 3.16f
@@ -57,9 +59,9 @@
 #define TEXTIFY(A) #A
 #define _OPTION_CREATOR(WIDTH, HEIGHT, RAD, CNT)	\
 				" -D WINDOW_WIDTH=" TEXTIFY(WIDTH) 		\
-			   " -D WINDOW_HEIGHT=" TEXTIFY(HEIGHT)	\
- 			   " -D SAT_RADIUS=" TEXTIFY(RAD)  			\
- 			   " -D SAT_COUNT=" TEXTIFY(CNT)
+				" -D WINDOW_HEIGHT=" TEXTIFY(HEIGHT)	\
+ 				" -D SAT_RADIUS=" TEXTIFY(RAD)  			\
+				" -D SAT_COUNT=" TEXTIFY(CNT)
 #define CL_OPTIONS _OPTION_CREATOR(WINDOW_WIDTH, WINDOW_HEIGHT, SATELITE_RADIUS, SATELITE_COUNT)
 
 // Is used to find out frame times
@@ -87,17 +89,40 @@ typedef struct{
    vector velocity;
 } satelite;
 
-typedef struct{
-	int window_height;
-	int window_width;
-	int satelite_count;
-	float satelite_radius;
-} render_parameters;
+
+typedef struct DeviceDesc{
+	cl_device_id    deviceId;
+	cl_device_type  deviceType;
+	char*           deviceTypeString;
+	char*           deviceName;
+} DeviceDesc;
+
+typedef struct ClDevice{
+	cl_mem satelite_id_gpu;
+	cl_mem satelite_data_gpu;
+	cl_mem pixels_gpu;
+	cl_mem pixel_start_offset_y;
+	cl_program program;
+	cl_kernel kernel;
+	cl_command_queue command_queue;
+	cl_context context;
+	cl_device_id device_id;
+   cl_platform_id platform_id;
+   cl_device_type type;
+   int global_start_x;
+   int global_stop_x;
+   int global_start_y;
+   int global_stop_y;
+   size_t *global_size;
+   size_t *local_size;
+   cl_event evnt;
+   char* pixel_ids;
+   int pixel_arr_size;
+   
+} ClDevice;
 
 // Pixel buffer which is rendered to the screen
 color* pixels;
-
-char* pixel_ids;
 
 // Pixel buffer which is used for error checking
 color* correctPixels;
@@ -105,38 +130,58 @@ color* correctPixels;
 // Buffer for all satelites in the space
 satelite* satelites;
 
-float render_avg = 0;
+//All found and accepted OpenCL devices
+ClDevice* cl_devices;
+int num_of_cldevices = 0;
 
 
-render_parameters* render_param = NULL;
+// ## You may add your own variables here ##
 
+#define MAX_CL_DEVICES 5
 #define MAX_SOURCE_SIZE (0x100000)
-#define MAX_OPTIONS_SIZE (0x100000)
-
+/*
 cl_platform_id platform_id = NULL;
 cl_device_id device_id = NULL;   
 cl_uint ret_num_devices;
 cl_uint ret_num_platforms;
-
-// ## You may add your own variables here ##
-
 cl_mem satelite_id_gpu = NULL;
 cl_mem satelite_data_gpu = NULL;
 cl_mem pixels_gpu = NULL;
-cl_mem render_parameters_gpu = NULL;
 cl_program program = NULL;
 cl_kernel kernel = NULL;
-command_queue = NULL;
+cl_command_queue command_queue = NULL;
 cl_context context = NULL;
+*/
+
+
+
+float render_avg = 55.0f;
+size_t *global_size = NULL;
+size_t *local_size = NULL;
+
+int itemsize_x = 0;
+int itemsize_y = 1;
+int testloops = 0;
+
+//char* pixel_ids = NULL;
+
+int best_frame_time = 99999;
+int best_coloring_time = 9999;
+int best_moving_time = 9999;
+float coloring_avg = 999.99f;
+double coloring_avg_cpu = 9999999.99f;
+double coloring_avg_gpu = 9999999.99f;
+double memory_avg_cpu = 9999999.99f;
+double memory_avg_gpu = 9999999.99f;
 
 
 
 
-const char *getErrorString(cl_int error){
+const char *getErrorString(cl_int error, int device_number){
 	int len;
-	clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, NULL, NULL, &len);
+	clGetProgramBuildInfo(cl_devices[device_number].program, cl_devices[device_number].device_id, CL_PROGRAM_BUILD_LOG, NULL, NULL, &len);
 	char *log = (char*)malloc(sizeof(char)*len);
-	clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, len, log, NULL);
+	clGetProgramBuildInfo(cl_devices[device_number].program, cl_devices[device_number].device_id, CL_PROGRAM_BUILD_LOG, len, log, NULL);
 	fprintf(stderr, log);
 	free(log);
 	
@@ -215,10 +260,97 @@ const char *getErrorString(cl_int error){
     }
 }
 
+int get_platforms_and_devices(ClDevice *CLdevices){
+	int              i;
+	cl_int              maxDevices = 5;
+	cl_device_id*       deviceIDs = (cl_device_id*)malloc(maxDevices*sizeof(cl_device_id));
+	cl_platform_id*     platforms = (cl_platform_id*)malloc(sizeof(cl_platform_id));
+	cl_int              err;
+	cl_uint             num_entries = 2;
+	cl_uint             available;
+	cl_uint             numDevices;
+	DeviceDesc*         devices;
+
+	int end_devices = 0;
+	cl_int result = clGetPlatformIDs(num_entries, platforms, &available);
+	for(int j= 0; j<available; j++){
+		err = clGetDeviceIDs(platforms[j], CL_DEVICE_TYPE_ALL, maxDevices, deviceIDs, &numDevices);
+
+		devices = (DeviceDesc*)malloc(numDevices*sizeof(DeviceDesc));
+
+		for(i=0 ; i<numDevices ; i++)		{
+			devices[i].deviceId = deviceIDs[i];
+			size_t actualSize;
+
+			//Getting the device type (processor, graphics card, accelerator)
+			result = clGetDeviceInfo(
+				deviceIDs[i], 
+				CL_DEVICE_TYPE, 
+				sizeof(cl_device_type), 
+				&devices[i].deviceType, 
+				&actualSize);
+
+			//Getting the human readable device type
+			switch(devices[i].deviceType)	{
+				 case CL_DEVICE_TYPE_CPU:               
+					devices[i].deviceTypeString = "Processor"; 
+					break;
+				 case CL_DEVICE_TYPE_GPU:               
+					devices[i].deviceTypeString = "Graphics card"; 
+					break;
+				 case CL_DEVICE_TYPE_ACCELERATOR:       
+					devices[i].deviceTypeString = "Accelerator"; 
+					break;
+				 default:                               
+					devices[i].deviceTypeString = "NONE"; 
+					break;
+			}
+
+			//Getting the device name
+			size_t deviceNameLength = 4096;
+			char* tempDeviceName = (char*)malloc(4096);
+			result |= clGetDeviceInfo(
+				deviceIDs[i], 
+				CL_DEVICE_NAME, 
+				deviceNameLength, 
+				tempDeviceName, 
+				&actualSize);
+			if(result == CL_SUCCESS){
+				devices[i].deviceName = (char*)malloc(actualSize);
+				memcpy(devices[i].deviceName, tempDeviceName, actualSize);
+				free(tempDeviceName);
+			}
+			//If an error occured
+			if(result != CL_SUCCESS){
+				printf("Error while getting device info\n");
+				return 0;
+			}
+		}
+
+		//And finally we print the information we wanted to have
+		for(i=0 ; i<numDevices ; i++){
+			printf("Device %s is of type %s\n", devices[i].deviceName, devices[i].deviceTypeString);
+			CLdevices[end_devices].device_id = deviceIDs[i];
+			CLdevices[end_devices].platform_id = platforms[j];
+			CLdevices[end_devices].type = devices[i].deviceType;
+			num_of_cldevices ++;
+			end_devices ++;
+		}
+	}
+	free(deviceIDs);
+	free(platforms);
+	return end_devices;
+}
 
 // ## You may add your own initialization routines here ##
 void init(){
-
+	FILE *fp2 = fopen("file.csv", "w");
+	if (fp2 == NULL)	{
+		 printf("Error opening file!\n");
+		 exit(1);
+	}
+	fprintf(fp2, "TotalFrameTime;moving;coloring;average;color_cpu_part;color_gpu_part;mem_cpu;mem_gpu;x_size;y_size;comment\n");
+	fclose(fp2);
 	fprintf(stdout, "init starts\n");
 	// Load the kernel source code into the array source_str
 	
@@ -236,115 +368,164 @@ void init(){
 	source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
 	fclose( fp );
 	
-	pixel_ids = (char*)malloc(sizeof(char) * SIZE);
+	
+	//global_size = (size_t*) malloc(sizeof(size_t)*2);
+	//local_size = (size_t*) malloc(sizeof(size_t)*2);
+	
+	cl_devices = (ClDevice*) malloc(sizeof(ClDevice)*MAX_CL_DEVICES);
 
-	render_param = (render_parameters*)malloc(sizeof(render_parameters));
-	render_param->window_height = WINDOW_HEIGHT;
-	render_param->window_width = WINDOW_WIDTH;
-	render_param->satelite_count = SATELITE_COUNT;
-	render_param->satelite_radius = SATELITE_RADIUS;
+	int found_devices = get_platforms_and_devices(cl_devices);
+	printf("found_devices:%d\n", found_devices);
 
-	fprintf(stdout, "Init platform\n");
-	// Get platform and device information
-	cl_int ret = clGetPlatformIDs(5, &platform_id, &ret_num_platforms);
-	printf("\nDetected OpenCL platforms: %d\n", ret_num_platforms);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
-	}
-	
-	ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1,  &device_id, &ret_num_devices);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
-	}
-	
-	// Create an OpenCL context
-	context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
-
-	// Create a command queue
-	command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
-   
-   fprintf(stdout, "Creating buffers\n");
-	// Create memory buffers on the device for each vector 
-	satelite_data_gpu = clCreateBuffer(context, CL_MEM_READ_ONLY,  SATELITE_COUNT * sizeof(satelite), NULL, &ret);
-	fprintf(stdout, "satelite_data_gpu size:%ld\n",SATELITE_COUNT * sizeof(satelite));
-	fprintf(stdout, "satelite_data_gpu id:%d\n",satelite_data_gpu);
+	cl_int ret = CL_SUCCESS;
 	
 	
-	render_parameters_gpu = clCreateBuffer(context, CL_MEM_READ_ONLY,  sizeof(render_parameters), NULL, &ret);
-	fprintf(stdout, "render_parameters size:%ld\n", sizeof(render_parameters));
-	fprintf(stdout, "render_parameters id:%d\n",render_parameters_gpu);
-	
-	
-	/*pixels_gpu = clCreateBuffer(context, CL_MEM_WRITE_ONLY, SIZE * sizeof(color), NULL, &ret);
-	fprintf(stdout, "pixels_gpu size:%ld\n",SIZE * sizeof(color));
-	fprintf(stdout, "pixels_gpu id:%d\n",pixels_gpu);
-	*/
-	
-	satelite_id_gpu = clCreateBuffer(context, CL_MEM_WRITE_ONLY,  sizeof(int)*SIZE, NULL, &ret);
-	fprintf(stdout, "render_parameters size:%ld\n", sizeof(int));
-	fprintf(stdout, "render_parameters id:%d\n",satelite_id_gpu);
-	
-	// Create a program from the kernel source
-	program = clCreateProgramWithSource(context, 1, (const char **)&source_str, (const size_t *)&source_size, &ret);
-
-	// Build the program
-	char *opts = CL_OPTIONS;
-	printf("CL-kernel options: %s\n", CL_OPTIONS);
-
-	fprintf(stdout, "Bulding OpenCL kernel\n");
-	ret = clBuildProgram(program, 1, &device_id, opts, NULL, NULL);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, "ERROR clBuildProgram\n");
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
-	}
-	// Create the OpenCL kernel
-	kernel = clCreateKernel(program, "render", &ret);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, "ERROR clCreateKernel\n");
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
-	}
-	
-	
-	fprintf(stdout, "Setting kernel argument locations\n");
-	ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&satelite_data_gpu);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
-	}
-	
-	ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&render_parameters_gpu);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
-	}
-	/*ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&pixels_gpu);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
-	}*/
-	
-	ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&satelite_id_gpu);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
-	}
+	//Share workload equally between devices
+	for (int i=0;i<found_devices;i++){
+		fprintf(stdout, "\nInitializin device, type: ");
+		switch(cl_devices[i].type)	{
+			 case CL_DEVICE_TYPE_CPU:               
+				fprintf(stdout,"Processor\n"); 
+				break;
+			 case CL_DEVICE_TYPE_GPU:               
+				fprintf(stdout,"Graphics card\n");
+				break;
+			 case CL_DEVICE_TYPE_ACCELERATOR:      
+				fprintf(stdout,"Accelerator\n");
+				break;
+			 default:                              
+				fprintf(stdout,"NONE\n");
+				break;
+		}
+		int division_ratio = 2; //FIXME, now stupid 2 device hardcoded ratio
 		
+		if (i==0){
+			cl_devices[i].global_start_x = 0;
+			cl_devices[i].global_stop_x = WINDOW_WIDTH;
+			cl_devices[i].global_start_y = (WINDOW_HEIGHT/division_ratio)*0;
+			cl_devices[i].global_stop_y = (WINDOW_HEIGHT/division_ratio)*(1);
+			cl_devices[i].pixel_ids = (color*)malloc(sizeof(color) * (SIZE/division_ratio*(1))); //TODO fix this to be only this device render area. now we are using x. times too much memory
+			cl_devices[i].pixel_arr_size = (SIZE/division_ratio)*(1);
+		}
+		else{
+			cl_devices[i].global_start_x = 0;
+			cl_devices[i].global_stop_x = WINDOW_WIDTH;
+			cl_devices[i].global_start_y = (WINDOW_HEIGHT/division_ratio)*1;
+			cl_devices[i].global_stop_y = (WINDOW_HEIGHT/division_ratio)*(division_ratio);
+			cl_devices[i].pixel_ids = (color*)malloc(sizeof(color) * (SIZE/division_ratio)*(division_ratio-1)); //TODO fix this to be only this device render area. now we are using x. times too much memory
+			cl_devices[i].pixel_arr_size = (SIZE/division_ratio)*(division_ratio-1);
+		}
+		
+		cl_devices[i].global_size = (size_t*) malloc(sizeof(size_t)*2);
+		cl_devices[i].local_size = (size_t*) malloc(sizeof(size_t)*2);
+		
+		
+		if (cl_devices[i].global_size == NULL || cl_devices[i].local_size == NULL){
+			fprintf(stderr, "memory allocation failed\n");
+			exit(1);
+		}
+
+		// Create an OpenCL context
+		cl_devices[i].context = clCreateContext( NULL, 1, &cl_devices[i].device_id, NULL, NULL, &ret);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, "ERROR  clCreateContext\n");
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+
+		// Create a command queue
+		cl_devices[i].command_queue = clCreateCommandQueue(cl_devices[i].context, cl_devices[i].device_id, 0, &ret);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, "ERROR  clCreateCommandQueue\n");
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+		
+		
+		fprintf(stdout, "Creating buffers\n");
+		// Create memory buffers on the device for each vector 
+		cl_devices[i].satelite_data_gpu = clCreateBuffer(cl_devices[i].context, CL_MEM_READ_ONLY,  SATELITE_COUNT * sizeof(satelite), NULL, &ret);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, "ERROR satelite_data_gpu\n");
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+		fprintf(stdout, "satelite_data_gpu size:%ld\n",SATELITE_COUNT * sizeof(satelite));
+		fprintf(stdout, "satelite_data_gpu id:%d\n",cl_devices[i].satelite_data_gpu);
 	
-	fprintf(stdout, "Setting kernel render parameters\n");
-	ret = clEnqueueWriteBuffer(command_queue, render_parameters_gpu, CL_TRUE, 0, sizeof(render_parameters), render_param, 0, NULL, NULL);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
+		cl_devices[i].satelite_id_gpu = clCreateBuffer(cl_devices[i].context, CL_MEM_WRITE_ONLY,  sizeof(color)*SIZE, NULL, &ret);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, "ERROR satelite_id_gpu\n");
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+		fprintf(stdout, "pixel_arr_size size:%ld\n", sizeof(color)*cl_devices[i].pixel_arr_size);
+		fprintf(stdout, "pixel_arr_size id:%d\n",cl_devices[i].satelite_id_gpu);
+	
+		cl_devices[i].pixel_start_offset_y = clCreateBuffer(cl_devices[i].context, CL_MEM_READ_ONLY,  sizeof(int), NULL, &ret);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, "ERROR satelite_id_gpu\n");
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}	
+	
+		// Create a program from the kernel source
+		cl_devices[i].program = clCreateProgramWithSource(cl_devices[i].context, 1, (const char **)&source_str, (const size_t *)&source_size, &ret);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, "ERROR clCreateProgramWithSource\n");
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+
+		// Build the program
+		char *opts = CL_OPTIONS;
+		printf("CL-kernel options: %s\n", CL_OPTIONS);
+
+		fprintf(stdout, "Bulding OpenCL kernel\n");
+		ret = clBuildProgram(cl_devices[i].program, 1, &cl_devices[i].device_id, opts, NULL, NULL);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, "ERROR clBuildProgram\n");
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+		// Create the OpenCL kernel
+		cl_devices[i].kernel = clCreateKernel(cl_devices[i].program, "render", &ret);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, "ERROR clCreateKernel\n");
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+	
+	
+		fprintf(stdout, "Setting kernel argument locations\n");
+		ret = clSetKernelArg(cl_devices[i].kernel, 0, sizeof(cl_mem), (void *)&cl_devices[i].satelite_data_gpu);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+	
+		ret = clSetKernelArg(cl_devices[i].kernel, 1, sizeof(cl_mem), (void *)&cl_devices[i].satelite_id_gpu);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+		
+		ret = clSetKernelArg(cl_devices[i].kernel, 2, sizeof(cl_mem), (void *)&cl_devices[i].pixel_start_offset_y);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, getErrorString(ret, i));
+			exit(0);
+		}
+		
+		//Set pixel offsets for different devices
+		
+		fprintf(stdout, "cl_devices[i].global_start_y:%d\n",cl_devices[i].global_start_y);
+		ret = clEnqueueWriteBuffer(cl_devices[i].command_queue, cl_devices[i].pixel_start_offset_y, CL_TRUE, 0, sizeof(int), &cl_devices[i].global_start_y, 0, NULL, NULL);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, getErrorString(ret, 1));
+			exit(0);
+		}
 	}
-	
-	
 	fprintf(stdout, "init ends\n");
-	//printf( "init ends");
-   //c = getchar( );
 }
 
 // ## You are asked to make this code parallel ##
@@ -355,110 +536,249 @@ void init(){
 void parallelPhysicsEngine(int deltaTime){
 	//fprintf(stdout, "parallelPhysicsEngine starts\n");
    const int physicsUpdatesInOneFrame = 10000;
-   #pragma omp parallel for
-   for(int physicsUpdateIndex = 0; 
-      physicsUpdateIndex < physicsUpdatesInOneFrame; 
-      ++physicsUpdateIndex){
+	#pragma omp parallel for
+   for(int i = 0; i < SATELITE_COUNT; ++i){
+      // Distance to the blackhole (bit ugly code because C-struct cannot have member functions)
+      vector positionToBlackHole = {.x = satelites[i].position.x -
+         HORIZONTAL_CENTER, .y = satelites[i].position.y - VERTICAL_CENTER};
+      float distToBlackHoleSquared = 
+         positionToBlackHole.x * positionToBlackHole.x +
+         positionToBlackHole.y * positionToBlackHole.y;
+      float distToBlackHole = sqrt(distToBlackHoleSquared);
 
-      for(int i = 0; i < SATELITE_COUNT; ++i){
+      // Gravity force
+      vector normalizedDirection = { 
+         .x = positionToBlackHole.x / distToBlackHole,
+         .y = positionToBlackHole.y / distToBlackHole};
+      float accumulation = GRAVITY / distToBlackHoleSquared;
 
-         // Distance to the blackhole (bit ugly code because C-struct cannot have member functions)
-         vector positionToBlackHole = {.x = satelites[i].position.x -
-            HORIZONTAL_CENTER, .y = satelites[i].position.y - VERTICAL_CENTER};
-         float distToBlackHoleSquared = 
-            positionToBlackHole.x * positionToBlackHole.x +
-            positionToBlackHole.y * positionToBlackHole.y;
-         float distToBlackHole = sqrt(distToBlackHoleSquared);
+      // Delta time is used to make velocity same despite different FPS
+      // Update velocity based on force
+      for(int physicsUpdateIndex = 0; physicsUpdateIndex < physicsUpdatesInOneFrame; ++physicsUpdateIndex){
+	      satelites[i].velocity.x -= accumulation * normalizedDirection.x * deltaTime / physicsUpdatesInOneFrame;
+	      satelites[i].velocity.y -= accumulation * normalizedDirection.y * deltaTime / physicsUpdatesInOneFrame;
 
-         // Gravity force
-         vector normalizedDirection = { 
-            .x = positionToBlackHole.x / distToBlackHole,
-            .y = positionToBlackHole.y / distToBlackHole};
-         float accumulation = GRAVITY / distToBlackHoleSquared;
-
-         // Delta time is used to make velocity same despite different FPS
-         // Update velocity based on force
-         satelites[i].velocity.x -= accumulation * normalizedDirection.x *
-            deltaTime / physicsUpdatesInOneFrame;
-         satelites[i].velocity.y -= accumulation * normalizedDirection.y *
-            deltaTime / physicsUpdatesInOneFrame;
-
-         // Update position based on velocity
-         satelites[i].position.x = satelites[i].position.x +
-            satelites[i].velocity.x * deltaTime / physicsUpdatesInOneFrame;
-         satelites[i].position.y = satelites[i].position.y +
-            satelites[i].velocity.y * deltaTime / physicsUpdatesInOneFrame;
+	      // Update position based on velocity
+	      satelites[i].position.x = satelites[i].position.x + satelites[i].velocity.x * deltaTime / physicsUpdatesInOneFrame;
+	      satelites[i].position.y = satelites[i].position.y + satelites[i].velocity.y * deltaTime / physicsUpdatesInOneFrame;
       }
    }
+
    //fprintf(stdout, "parallelPhysicsEngine ends\n");
 }
 
 // ## You are asked to make this code parallel ##
 // Rendering loop (This is called once a frame after physics engine) 
 // Decides the color for each pixel.
-int first = 0;
 void parallelGraphicsEngine(){
-
+	struct timeval t1, t2,t3_sub1,t3_sub2, t3, t4, t5, t6, t4_sub1, t4_sub2;
+	gettimeofday(&t1, NULL);
+	
+	
 	cl_int ret = 0;
-	// Copy the lists A and B to their respective memory buffers
-
-	ret = clEnqueueWriteBuffer(command_queue, satelite_data_gpu, CL_TRUE, 0, SATELITE_COUNT * sizeof(satelite), satelites, 0, NULL, NULL);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
+	//Copy Satellite positions to all Available devices
+	for (int i = 0; i< num_of_cldevices;i++){
+		ret = clEnqueueWriteBuffer(cl_devices[i].command_queue, cl_devices[i].satelite_data_gpu, CL_FALSE, 0, SATELITE_COUNT * sizeof(satelite), satelites, 0, NULL, &cl_devices[i].evnt);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, getErrorString(ret, 1));
+			exit(0);
+		}
+		
 	}
-	
-	
-	// Execute the OpenCL kernel on the list
-	size_t global_item_size = SIZE/LOCAL_ITEM_SIZE;//LOCAL_ITEM_SIZE; // Process the entire lists
-	size_t local_item_size = LOCAL_ITEM_SIZE; // Divide work items into groups of 64
-	ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_item_size, &local_item_size, 0, NULL, NULL);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
+	for (int i = 0; i< num_of_cldevices;i++){
+		ret = clWaitForEvents(1, &cl_devices[i].evnt);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, getErrorString(ret, 1));
+		}
+		clReleaseEvent(cl_devices[i].evnt);
 	}
+	gettimeofday(&t2, NULL);
+		
+		
+	while(1){
+		if (testloops == 100){
+			if (best_frame_time < 99999){
+				FILE *fp = fopen("file.csv", "a");   
+				fprintf(fp, "%d;%d;%d;%.2f;%.0f;%.0f;%.0f;%.0f;%d;%d;%dx%d\n",best_frame_time, best_moving_time, best_coloring_time, coloring_avg, coloring_avg_cpu,coloring_avg_gpu,memory_avg_cpu,memory_avg_gpu, itemsize_x, itemsize_y,itemsize_x, itemsize_y);   
+				
+				fclose(fp);
+			}
+			testloops = 0;
+			best_frame_time = 99999;
+			best_coloring_time = 9999;
+			best_moving_time = 9999;
+			coloring_avg = 99.9f;
+			coloring_avg_cpu = 9999999999.9f;
+			coloring_avg_gpu = 9999999999.9f;
+			memory_avg_cpu = 999999999.9f;
+			memory_avg_gpu = 999999999.9f;
+			render_avg = 55.0f;
+		}
+		//Set the size
+		if (testloops == 0){
+			itemsize_x++;
+			if (itemsize_x > 256){
+				itemsize_y++;
+				itemsize_x = 1;
+			}
+			if (itemsize_y > 128){
+				itemsize_y = 1;
+				exit(1);
+			}
+			
+			for (int i = 0; i< num_of_cldevices;i++){
+				cl_devices[i].global_size[0] = WINDOW_WIDTH/itemsize_x; cl_devices[i].global_size[1] = (cl_devices[i].global_stop_y - cl_devices[i].global_start_y) / itemsize_y;
+				cl_devices[i].local_size[0] = itemsize_x; cl_devices[i].local_size[1] = itemsize_y;
+				//fprintf(stdout, "global_size_x:%d, global_size_y:%d\n",cl_devices[i].global_size[0],cl_devices[i].global_size[1]);
+				//fprintf(stdout, "local_size_x:%d, local_size_y:%d\n",cl_devices[i].local_size[0],cl_devices[i].local_size[1]);
+			}
+			fprintf(stdout, "itemsize_x:%d, itemsize_y:%d\n",itemsize_x,itemsize_y);
+			
+		}
 	
-	/*
-	ret = clEnqueueReadBuffer(command_queue, pixels_gpu, CL_TRUE, 0, SIZE * sizeof(color), pixels, 0, NULL, NULL);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
-	}*/
-	
-	ret = clEnqueueReadBuffer(command_queue, satelite_id_gpu, CL_TRUE, 0, SIZE * sizeof(char), pixel_ids, 0, NULL, NULL);
-	if (ret != CL_SUCCESS){
-		fprintf(stderr, getErrorString(ret));
-		exit(0);
+		testloops ++;
+		
+		
+		int size_ok = 0;
+		// wait event synchronization handle used by OpenCL API
+		for (int i = 0; i< num_of_cldevices;i++){
+			//fprintf(stdout,"clEnqueueNDRangeKernel starts_ device:%d global:%d local:%d\n",i,cl_devices[i].global_size, cl_devices[i].local_size);
+			ret = clEnqueueNDRangeKernel(cl_devices[i].command_queue, cl_devices[i].kernel, 2, NULL, cl_devices[i].global_size, cl_devices[i].local_size, 0, NULL, &cl_devices[i].evnt);
+			if (ret != CL_SUCCESS){
+				//fprintf(stderr, getErrorString(ret));
+				//exit(0);
+			}
+			else{	
+				size_ok ++;
+			}			
+		}
+		if (size_ok == num_of_cldevices){
+			break;
+		}			
 	}
-	
-	color default_cl = {.red = 1.0f, .green= 1.0f, .blue=1.0f};
-	for (int i = 0; i < SIZE; i++){
-		char id = pixel_ids[i];
-		if (id == -1){
-			pixels[i] = default_cl;
+	for (int i = 0; i < num_of_cldevices; i++){
+		ret = clWaitForEvents(1, &cl_devices[i].evnt);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, getErrorString(ret, 1));
+		}
+		clReleaseEvent(cl_devices[i].evnt);
+		if (i == 0){
+			gettimeofday(&t3_sub1, NULL);
 		}
 		else{
-			color cl = satelites[id].identifier;
-			pixels[i] = cl;
+			gettimeofday(&t3_sub2, NULL);			
 		}
 	}
+	
+	gettimeofday(&t3, NULL);
 
+	//fprintf(stdout,"num_of_cldevices\n");
+	
+	for (int i = 0; i< num_of_cldevices;i++){
+		ret = clEnqueueReadBuffer(	cl_devices[i].command_queue, 
+											cl_devices[i].satelite_id_gpu, 
+											CL_FALSE, 
+											cl_devices[i].global_start_y*WINDOW_WIDTH * sizeof(color), 
+											(cl_devices[i].global_stop_y-cl_devices[i].global_start_y)*WINDOW_WIDTH * sizeof(color), 
+											&pixels[cl_devices[i].global_start_y*WINDOW_WIDTH], 
+											0, 
+											NULL,
+											&cl_devices[i].evnt);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, getErrorString(ret, 1));
+			exit(0);
+		}	
+	}
+	
+	gettimeofday(&t4, NULL);
+	
+	for (int i = 0; i< num_of_cldevices;i++){
+		ret = clWaitForEvents(1, &cl_devices[i].evnt);
+		if (ret != CL_SUCCESS){
+			fprintf(stderr, getErrorString(ret, 1));
+		}
+		clReleaseEvent(cl_devices[i].evnt);
+		if (i == 0){
+			gettimeofday(&t4_sub1, NULL);
+		}
+		else{
+			gettimeofday(&t4_sub2, NULL);
+		}
+	}
+	gettimeofday(&t5, NULL);
+	
+	//fprintf(stdout, "Copy results to global\n");
+	/*color default_cl = {.red = 1.0f, .green= 1.0f, .blue=1.0f};
+	#pragma omp parallel for
+	for (int d = 0; d < num_of_cldevices; d++){
+		int offset_start = (cl_devices[d].global_start_y * WINDOW_WIDTH);
+		int offset_stop = (cl_devices[d].global_stop_y * WINDOW_WIDTH);
+		char *pixel_ids = cl_devices[d].pixel_ids;
+		for (int i = offset_start; i < offset_stop; i++){
+			char id = pixel_ids[i-offset_start];
+			if (id == -1){
+				pixels[i] = default_cl;
+			}
+			else{
+				color cl = satelites[id].identifier;
+				pixels[i] = cl;
+			}
+		}
+	}*/
+	gettimeofday(&t6, NULL);
+	
+	double elapsedTime_2 = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec);      // sec to ms
+	double elapsedTime_3 = (t3.tv_sec - t2.tv_sec) * 1000.0 + (t3.tv_usec - t2.tv_usec);      // sec to ms
+	double elapsedTime_3s1 = (t3_sub1.tv_sec - t2.tv_sec) * 1000.0 + (t3_sub1.tv_usec - t2.tv_usec);      // sec to ms
+	double elapsedTime_3s2 = (t3_sub2.tv_sec - t2.tv_sec) * 1000.0 + (t3_sub2.tv_usec - t2.tv_usec);      // sec to ms
+	double elapsedTime_4 = (t4.tv_sec - t3.tv_sec) * 1000.0 + (t4.tv_usec - t3.tv_usec);      // sec to ms
+	double elapsedTime_4s1 = (t4_sub1.tv_sec - t3.tv_sec) * 1000.0 + (t4_sub1.tv_usec - t3.tv_usec);      // sec to ms
+	double elapsedTime_4s2 = (t4_sub2.tv_sec - t3.tv_sec) * 1000.0 + (t4_sub2.tv_usec - t3.tv_usec);      // sec to ms
+	double elapsedTime_5 = (t4_sub2.tv_sec - t4.tv_sec) * 1000.0 + (t4_sub2.tv_usec - t4.tv_usec);      // sec to ms
+	double elapsedTime_6 = (t6.tv_sec - t5.tv_sec) * 1000.0 + (t6.tv_usec - t4_sub2.tv_usec);      // sec to ms
+	double total = (t6.tv_sec - t1.tv_sec) * 1000.0 + (t6.tv_usec - t1.tv_usec);      // sec to ms
+	fprintf(stdout,"total:%.2lf t2:%.2lf t3:%.2lf t3s1:%.2lf t3s2:%.2lf t4:%.2lf t4s1:%.2lf t4s2:%.2lf t5:%.2lf t6:%.2lf\n",total,elapsedTime_2,elapsedTime_3,elapsedTime_3s1,elapsedTime_3s2,elapsedTime_4,elapsedTime_4s1,elapsedTime_4s2,elapsedTime_5,elapsedTime_6);
+	
+	if (elapsedTime_3s1 > 0 && elapsedTime_3s2 > 0){
+		if (coloring_avg_cpu > elapsedTime_3s1){
+			coloring_avg_cpu = elapsedTime_3s1;
+		} 
+		if (coloring_avg_gpu > elapsedTime_3s2){
+			coloring_avg_gpu = elapsedTime_3s2;
+		} 
+		if (memory_avg_cpu > elapsedTime_4s1){
+			memory_avg_cpu = elapsedTime_4s1;
+		} 
+		if (memory_avg_gpu > elapsedTime_4s2){
+			memory_avg_gpu = elapsedTime_4s2;
+		} 
+	}
+	
 }
 
 // ## You may add your own destrcution routines here ##
 void destroy(){
+	for (int i = 0; i< num_of_cldevices;i++){
+		cl_int ret = clFlush(cl_devices[i].command_queue);
+		ret = clFinish(cl_devices[i].command_queue);
+		ret = clReleaseKernel(cl_devices[i].kernel);
+		ret = clReleaseProgram(cl_devices[i].program);
+		ret = clReleaseMemObject(cl_devices[i].satelite_data_gpu);
+		ret = clReleaseMemObject(cl_devices[i].pixels_gpu);
+		ret = clReleaseMemObject(cl_devices[i].pixel_start_offset_y);
+		ret = clReleaseCommandQueue(cl_devices[i].command_queue);
+		ret = clReleaseContext(cl_devices[i].context);
+   	free(cl_devices[i].global_size);
+   	free(cl_devices[i].local_size);
+   	free(cl_devices[i].pixel_ids);
+	}
+	free(cl_devices);
+	//Clean the size holders
+	//free(global_size);
+	//free(local_size);
+
 	// Clean up
-	free(pixel_ids);
-	free(render_param);
-	cl_int ret = clFlush(command_queue);
-	ret = clFinish(command_queue);
-	ret = clReleaseKernel(kernel);
-	ret = clReleaseProgram(program);
-	ret = clReleaseMemObject(satelite_data_gpu);
-	ret = clReleaseMemObject(pixels_gpu);
-	ret = clReleaseMemObject(render_parameters_gpu);
-	ret = clReleaseCommandQueue(command_queue);
-	ret = clReleaseContext(context);
+	//free(pixel_ids);
 }
 
 
@@ -541,9 +861,23 @@ void compute(void){
    // Print timings
    int pixelColoringTime = glutGet(GLUT_ELAPSED_TIME) - timeSinceStart;
    render_avg = (render_avg*9+pixelColoringTime)/10;
-   printf("Total frametime: %ims, satelite moving: %ims, space coloring: %ims. avg:%fms\n",
-      deltaTime, sateliteMovementTime, pixelColoringTime, render_avg);
-
+   printf("Total frametime: %ims, satelite moving: %ims, space coloring: %ims. avg:%fms is_x:%d is_y:%d\n",
+      deltaTime, sateliteMovementTime, pixelColoringTime, render_avg, itemsize_x, itemsize_y);
+   if (best_frame_time > deltaTime){
+   	best_frame_time = deltaTime;
+   }
+   if (best_moving_time > sateliteMovementTime){
+   	best_moving_time = sateliteMovementTime;
+   }
+   if (best_coloring_time > pixelColoringTime){
+   	best_coloring_time = pixelColoringTime;
+   }
+   if (coloring_avg > render_avg){
+		coloring_avg = render_avg;
+	}   
+	
+	
+   
    // Render the frame
    glutPostRedisplay();
 }
